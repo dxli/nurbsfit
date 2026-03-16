@@ -42,23 +42,18 @@ nurbsfit-v1.0/
   comparison/             <- Chamfer distance helpers
   configuration/          <- merge-config YAML files (per-experiment)
   preprocessing/          <- C++ source patches + batch GoCoPP script
+  data/
+    input/                <- place your GoCoPP outputs here (not committed)
+      <shape>/
+        <shape>.ply
+        <shape>_planar_primitives_detection.vg
+        <shape>_adjacency.txt
+        <shape>_GoCopp_metrics.txt
+    output/               <- pipeline results written here 
+      <shape>/
 ```
 
-Data must sit in sibling directories relative to the repo root:
-
-```
-<workspace>/
-  nurbsfit-v1.0/                       <- this repository
-  NURBS_fit/
-    data/<shape>/
-      <shape>.ply
-      <shape>_planar_primitives_detection.vg
-      <shape>_adjacency.txt
-      <shape>_GoCopp_metrics.txt
-    configuration/                     <- symlink or copy from repo (optional)
-  nurbs_fitting/
-    data/<shape>/                      <- outputs written here
-```
+> `data/input/` and `data/output/` are listed in `.gitignore` and will never be committed.
 
 ---
 
@@ -215,7 +210,7 @@ A convenience script is provided at `preprocessing/extract_primitives.sh`. Edit 
 
 ```bash
 input_folder="/path/to/your/pointclouds/"       # folder of .ply files
-output_folder="/path/to/NURBS_fit/data/"         # output root
+output_folder="/path/to/nurbsfit-v1.0/data/input/"  # output root
 executable="/path/to/GoCoPP_original/source/build/bin/Release/GoCoPP"
 ```
 
@@ -244,8 +239,8 @@ NURBSFit uses two levels of configuration:
 
 ```yaml
 paths:
-  input_dir:  "NURBS_fit/data/"
-  output_dir: "nurbs_fitting/data/"
+  input_dir:  "data/input/"
+  output_dir: "data/output/"
 
 network_params:
   p: 3
@@ -339,25 +334,27 @@ Confirm that `nvcc --version` and `python -c "import torch; print(torch.version.
 If you use this code in your research, please cite:
 
 ```bibtex
-@inproceedings{fuentesperez2026nurbsfit,
-  title     = {NURBSFit: Robust Fitting of NURBS Surfaces to Point Clouds},
-  author    = {Fuentes Perez, Lizeth J. and Lafarge, Florent and Pajarola, Renato},
-  booktitle = {International Conference on 3D Vision (3DV)},
-  year      = {2026}}
+@inproceedings{nurbsfit,
+  title={NURBSFit: Robust Fitting of NURBS Surfaces to Point Clouds},
+  author={Fuentes Perez, Lizeth J. and Lafarge, Florent and Pajarola, Renato},
+  booktitle={International Conference on 3D Vision},
+  year={2026}
 }
 ```
+
+[[HAL]](https://hal.science/hal-05411017) [[PDF]](https://hal.science/hal-05411017v1/file/camera_ready_nurbsfit.pdf)
 
 Please also cite the dependencies used by this work:
 
 ```bibtex
 
 
-@INPROCEEDINGS{{Yu_cvpr22,
-  Author = {Yu, Mulin and Lafarge, Florent},
-  Title = {Finding Good Configurations of Planar Primitives in Unorganized Point Clouds},
-  booktitle = {Proc. of the IEEE conference on Computer Vision and Pattern Recognition (CVPR)},
-  Year = {2022},
-  address = {New Orleans, US},
+@inproceedings{yu2022gocopp,
+  author    = {Yu, Mulin and Lafarge, Florent},
+  title     = {Finding Good Configurations of Planar Primitives in Unorganized Point Clouds},
+  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2022},
+  address   = {New Orleans, US}
 }
 
 @misc{nurbsdiff,
@@ -390,7 +387,7 @@ Please also cite the dependencies used by this work:
 
 ## References
 
-**[1]** Fuentes Perez, L., Lafarge F. and Pajarola, R. *NURBSFit: Robust Fitting of NURBS Surfaces to Point Clouds.* 3DV 2026.
+**[1]** Fuentes Perez, L.J., Lafarge, F. and Pajarola, R. *NURBSFit: Robust Fitting of NURBS Surfaces to Point Clouds.* 3DV 2026, Vancouver, Canada. [[HAL]](https://hal.science/hal-05411017) [[PDF]](https://hal.science/hal-05411017v1/file/camera_ready_nurbsfit.pdf)
 
 **[2]** Yu, M. and Lafarge, F. *Finding Good Configurations of Planar Primitives in Unorganized Point Clouds.* CVPR 2022. [[Paper]](https://hal.inria.fr/hal-03621896/document) [[Code]](https://www-sop.inria.fr/members/Florent.Lafarge/code/GoCoPP.zip)
 
