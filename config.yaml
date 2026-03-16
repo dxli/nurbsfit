@@ -1,0 +1,20 @@
+
+paths:
+  input_dir: "data/input/"
+  output_dir: "data/output/"
+
+network_params:
+  p: 3
+  q: 3
+  n_ctrpts: 4
+  w_lap: 0.1
+  w_chamfer: 1
+  learning_rate: 0.05
+  samples_res: 100
+  num_epochs: 20
+  mod_iter: 21
+
+options:
+  save_points: true
+  save_control_polygon: true
+  save_colored_mesh: true

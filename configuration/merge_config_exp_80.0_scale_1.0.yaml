@@ -1,0 +1,7 @@
+
+exp_number 80
+l_pcoverage 0.5
+l_fidelity 0.1
+l_simplicity 0.4
+epsilon_factor 1                                   
+include_outliers True

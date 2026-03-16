@@ -1,0 +1,10 @@
+npoints 10000
+epsilon 0.1
+bbox_diagonal 1.18135
+KNN 20
+normal_threshold 0.85
+primitives 19
+coverage 0.9964
+mean_error 0.00620067
+mean_normal_deviation 0.968481
+
