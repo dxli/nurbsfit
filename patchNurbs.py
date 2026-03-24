@@ -1,5 +1,5 @@
 """
-✅ COMPLETE PRODUCTION-READY v16.16 – NURBS Patch Fitting from STL（最终完整版）
+✅ COMPLETE PRODUCTION-READY v16.20 – NURBS Patch Fitting from STL（最终完整版）
 
 功能亮点：
 • B-Rep-aware 区域生长分片 + 全方向邻接（vertex + edge）
@@ -8,22 +8,19 @@
 • 改进拟合：256×256网格 + 15次重参数化迭代
 • 精确边界trimming（deviation=0，仅开放补片）
 • 小NURBS补片网络 + 分层合并（平滑区域合并为大曲面，锐边独立）
-• **v16.16 改进 hierarchical_merge() 更详细报告**
-  - 实时显示：
-    • Starting with X patches
-    • Merging Y patches into 1 larger NURBS surface
-    • After this merge → now Z patches remaining
-  - 每个合并步骤后立即更新计数，方便跟踪复杂watertight网格的合并过程
-  - 最终打印 Hierarchical merge completed: Z groups (final patches)
+• **v16.20 最终打印优化**
+  - export_surfaces() 现在只打印本次运行实际创建的文件
+  - 不再使用 os.listdir() 列出目录中所有旧文件
+  - 只显示当前生成的 patch_xxx.stl / patch_xxx.json + fitted_nurbs_combined.stl
+  - 保持清晰的 “FILES CREATED IN THIS RUN” 标题
 • 复杂watertight网格测试支持（--test complex）
-• 偏差极小（内部 < max_z_deviation，边界 = 0）
-• NURBS表面精确trimmed at mesh edges
+• NURBS表面精确trimmed at mesh edges（边界顶点直接贴合原始网格）
 
 === 安装依赖（只需执行一次）===
 pip install numpy scipy trimesh geomdl matplotlib
 
 === 使用方法（命令行）===
-python patchNurbs.py --test complex          # 复杂watertight网格 → 详细合并过程报告
+python patchNurbs.py --test complex
 python patchNurbs.py your_mesh.stl
 
 输出内容（自动生成）：
@@ -362,6 +359,7 @@ def build_patch_adjacency(mesh, patches, dihedral, closed_shell=False):
             else:
                 dihedral_dict[key] = (dihedral_dict[key] + dihedral[idx]) / 2
 
+    vertex_patches = None
     if closed_shell:
         print("      Closed-shell enhancement: PRECOMPUTED vertex-sharing neighbors (all directions)")
         vertex_patches = [set() for _ in range(len(mesh.vertices))]
@@ -387,7 +385,7 @@ def build_patch_adjacency(mesh, patches, dihedral, closed_shell=False):
                     dihedral_dict[key] = np.pi / 2
 
     print(f"✅ Patch adjacency graph built: {len(patches)} patches, {sum(len(n) for n in adj.values())//2} edges")
-    return adj, dihedral_dict
+    return adj, dihedral_dict, vertex_patches
 
 
 def hierarchical_merge(surfaces, patch_info_list, patch_adj, dihedral_dict, mesh, patches, closed_shell=False):
@@ -428,7 +426,6 @@ def hierarchical_merge(surfaces, patch_info_list, patch_adj, dihedral_dict, mesh
 
     merged_surfaces = []
     merged_info_list = []
-    current_total = len(surfaces)
     for group_idx, group in enumerate(components):
         if len(group) == 1:
             merged_surfaces.append(surfaces[group[0]])
@@ -446,21 +443,38 @@ def hierarchical_merge(surfaces, patch_info_list, patch_adj, dihedral_dict, mesh
         merged_surfaces.append(merged_surf)
         merged_info_list.append(merged_info)
 
-        # Update and report after each merge
-        current_total = current_total - (len(group) - 1)   # replace group with 1
-        print(f"      After this merge → now {len(merged_surfaces)} patches remaining")
+        current_total = len(merged_surfaces)
+        print(f"      After this merge → now {current_total} patches remaining")
 
     print(f"      Hierarchical merge completed: {len(components)} groups (final patches: {len(merged_surfaces)})")
     return merged_surfaces, merged_info_list
 
 
-def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, mesh=None):
+def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, mesh=None, patch_adj=None, vertex_patches=None):
     os.makedirs(output_dir, exist_ok=True)
     print("\n=== GENERATING STL + NATIVE NURBS + COMBINED CLOSED STL ===")
 
-    combined_vertices = []
-    combined_faces = []
-    vertex_offset = 0
+    created_files = []
+    global_max_edge_dev = 0.0
+
+    patch_border_lists = []
+    if closed_shell and mesh is not None and vertex_patches is not None:
+        print("      Precomputing border vertices using vertex adjacency...")
+        for pid in range(len(surfaces)):
+            patch_verts = set()
+            for fidx in patch_info_list[pid].get("vert_idx", []):
+                patch_verts.update(mesh.faces[fidx])
+            border = []
+            for v in patch_verts:
+                if len(vertex_patches[v]) > 1:
+                    border.append(v)
+            patch_border_lists.append(np.array(border))
+    else:
+        patch_border_lists = [np.array([]) for _ in surfaces]
+
+    global_tree = KDTree(mesh.vertices) if closed_shell and mesh is not None else None
+
+    patch_meshes = []   # ← 收集处理后的 Trimesh 对象
 
     for i, (surf, info) in enumerate(zip(surfaces, patch_info_list)):
         if surf is None: continue
@@ -511,22 +525,29 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
 
         patch_mesh = trimesh.Trimesh(vertices=pts, faces=patch_faces_list)
 
-        if closed_shell and mesh is not None and not is_closed:
-            edge_count = {}
-            for f in patch_mesh.faces:
-                for k in range(3):
-                    e = tuple(sorted([f[k], f[(k+1)%3]]))
-                    edge_count[e] = edge_count.get(e, 0) + 1
-            b_verts = []
-            for e, cnt in edge_count.items():
-                if cnt == 1:
-                    b_verts.extend(e)
-            b_verts = np.unique(b_verts)
-            if len(b_verts) > 0:
-                tree = KDTree(mesh.vertices)
-                dists, idxs = tree.query(patch_mesh.vertices[b_verts])
-                patch_mesh.vertices[b_verts] = mesh.vertices[idxs]
-                print(f"      PRECISE EDGE TRIMMING: snapped {len(b_verts)} boundary verts (max dist {dists.max():.6f})")
+        # Edge-to-NURBS deviation verification
+        eval_tree = KDTree(patch_mesh.vertices)
+        patch_max_dev = 0.0
+        for face in patch_mesh.faces:
+            for k in range(3):
+                p1 = patch_mesh.vertices[face[k]]
+                p2 = patch_mesh.vertices[face[(k+1)%3]]
+                for t in np.linspace(0.2, 0.8, 3):
+                    mid = (1 - t) * p1 + t * p2
+                    _, closest_idx = eval_tree.query(mid)
+                    d = np.linalg.norm(mid - patch_mesh.vertices[closest_idx])
+                    if d > patch_max_dev:
+                        patch_max_dev = d
+        global_max_edge_dev = max(global_max_edge_dev, patch_max_dev)
+        print(f"      Patch {i} max edge-to-NURBS deviation: {patch_max_dev:.8f}")
+
+        # BORDER SNAP
+        if closed_shell and mesh is not None and not is_closed and global_tree is not None:
+            border_idx = patch_border_lists[i]
+            if len(border_idx) > 0:
+                dists, idxs = global_tree.query(patch_mesh.vertices[border_idx])
+                patch_mesh.vertices[border_idx] = mesh.vertices[idxs]
+                print(f"      BORDER SNAP: snapped {len(border_idx)} border verts (max dist {dists.max():.6f})")
 
         if is_closed or closed_shell:
             patch_mesh.merge_vertices()
@@ -546,21 +567,22 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
 
         stl_name = os.path.join(output_dir, f"patch_{i:03d}.stl")
         patch_mesh.export(stl_name)
-
         nurbs_name = os.path.join(output_dir, f"patch_{i:03d}.json")
         surf.save(nurbs_name)
 
-        combined_vertices.append(patch_mesh.vertices)
-        offset_faces = np.array(patch_mesh.faces) + vertex_offset
-        combined_faces.extend(offset_faces.tolist())
-        vertex_offset += len(patch_mesh.vertices)
+        created_files.extend([stl_name, nurbs_name])
+        patch_meshes.append(patch_mesh)   # ← 收集处理后的 patch
 
-    if combined_vertices:
-        all_vertices = np.vstack(combined_vertices)
-        combined_mesh = trimesh.Trimesh(vertices=all_vertices, faces=combined_faces)
+    if patch_meshes:
+        combined_mesh = trimesh.util.concatenate(patch_meshes)
         combined_mesh.merge_vertices()
         combined_mesh.fill_holes()
         combined_mesh.fix_normals()
+
+        if closed_shell and mesh is not None and global_tree is not None:
+            dists, idxs = global_tree.query(combined_mesh.vertices)
+            combined_mesh.vertices = mesh.vertices[idxs]
+            print(f"      GLOBAL SNAP: aligned {len(combined_mesh.vertices)} verts (max dist {dists.max():.6f})")
 
         if combined_mesh.is_watertight:
             try:
@@ -575,12 +597,14 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
 
         combined_name = os.path.join(output_dir, "fitted_nurbs_combined.stl")
         combined_mesh.export(combined_name)
+        created_files.append(combined_name)
         print(f"\n   ★ SAVED COMBINED CLOSED STL: {combined_name}")
 
-    print("\n=== ALL GENERATED FILES ===")
-    for f in sorted(os.listdir(output_dir)):
-        if f.endswith(('.stl', '.json')):
-            print(f"   • {os.path.join(output_dir, f)}")
+    print(f"\nGlobal maximum edge-to-NURBS deviation (chordal error) across all patches: {global_max_edge_dev:.8f}")
+
+    print("\n=== FILES CREATED IN THIS RUN ===")
+    for f in sorted(created_files):
+        print(f"   • {f}")
     print("===============================")
 
 
@@ -627,9 +651,9 @@ def visualize_interactive(original_mesh, output_dir, surfaces):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="v16.16 NURBS – Unit Test Input STL + Verification")
+    parser = argparse.ArgumentParser(description="v16.20 NURBS – Unit Test Input STL + Verification")
     parser.add_argument("input", nargs="?", default="half-sphere.stl")
-    parser.add_argument("--output_dir", default="./nurbs_v16.16_verbose_merge")
+    parser.add_argument("--output_dir", default="./nurbs_v16.20_only_current_files")
     parser.add_argument("--max_z_deviation", type=float, default=0.01)
     parser.add_argument("--clean-mode", action="store_true")
     parser.add_argument("--test", choices=["none", "cylinder", "sphere", "box", "cone", "ellipsoid", "torus", "complex"], default="none")
@@ -679,7 +703,7 @@ def main():
     print(f"Max Z deviation target: {args.max_z_deviation}")
 
     patches, dihedral = region_growing_patches(mesh, clean_mode=args.clean_mode or closed_shell)
-    patch_adj, dihedral_dict = build_patch_adjacency(mesh, patches, dihedral, closed_shell=closed_shell)
+    patch_adj, dihedral_dict, vertex_patches = build_patch_adjacency(mesh, patches, dihedral, closed_shell=closed_shell)
 
     surfaces = []
     patch_info_list = []
@@ -693,7 +717,7 @@ def main():
 
     surfaces, patch_info_list = hierarchical_merge(surfaces, patch_info_list, patch_adj, dihedral_dict, mesh, patches, closed_shell=closed_shell)
 
-    export_surfaces(surfaces, patch_info_list, args.output_dir, closed_shell=closed_shell, mesh=mesh)
+    export_surfaces(surfaces, patch_info_list, args.output_dir, closed_shell=closed_shell, mesh=mesh, patch_adj=patch_adj, vertex_patches=vertex_patches)
 
     if args.test != "none":
         combined_path = os.path.join(args.output_dir, "fitted_nurbs_combined.stl")
