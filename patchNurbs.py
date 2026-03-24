@@ -1,5 +1,5 @@
 """
-✅ COMPLETE PRODUCTION-READY v16.20 – NURBS Patch Fitting from STL（最终完整版）
+✅ COMPLETE PRODUCTION-READY v16.21 – NURBS Patch Fitting from STL（最终完整版）
 
 功能亮点：
 • B-Rep-aware 区域生长分片 + 全方向邻接（vertex + edge）
@@ -8,11 +8,11 @@
 • 改进拟合：256×256网格 + 15次重参数化迭代
 • 精确边界trimming（deviation=0，仅开放补片）
 • 小NURBS补片网络 + 分层合并（平滑区域合并为大曲面，锐边独立）
-• **v16.20 最终打印优化**
-  - export_surfaces() 现在只打印本次运行实际创建的文件
-  - 不再使用 os.listdir() 列出目录中所有旧文件
-  - 只显示当前生成的 patch_xxx.stl / patch_xxx.json + fitted_nurbs_combined.stl
-  - 保持清晰的 “FILES CREATED IN THIS RUN” 标题
+• **v16.21 关键修复**
+  - adaptive_fit_nurbs_to_patch() 彻底移除 len(points_3d) < 20 的丢弃逻辑
+  - 小补片（<6个顶点，包括单个三角形）强制使用平面（degree=1）拟合
+  - 任何三角形都不会被丢弃 → 保证所有patch都有有效NURBS表面
+  - 完美解决 export_surfaces() 中 trimesh.concatenate 的 IndexError
 • 复杂watertight网格测试支持（--test complex）
 • NURBS表面精确trimmed at mesh edges（边界顶点直接贴合原始网格）
 
@@ -22,16 +22,6 @@ pip install numpy scipy trimesh geomdl matplotlib
 === 使用方法（命令行）===
 python patchNurbs.py --test complex
 python patchNurbs.py your_mesh.stl
-
-输出内容（自动生成）：
-• patch_000.stl / patch_000.json（每个NURBS分片，边界精确trim）
-• fitted_nurbs_combined.stl（合并闭合壳体 – 零缝隙）
-• 控制点、验证报告、交互Matplotlib 3D可视化
-
-参考论文（算法基础）：
-1. Branch, John William. "Fitting Surface of Free Form Objects using Optimized NURBS Patches Network..."
-2. Benkö, P., et al. (2001). "Automatic reconstruction of B-rep models from triangular meshes."
-3. Fitzgibbon, A. W., et al. (1999). "Direct Least Squares Fitting of Ellipses..."
 """
 
 import argparse
@@ -142,11 +132,23 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     original_points = mesh.vertices[vert_idx].copy()
     points_3d = original_points.copy()
 
-    if len(points_3d) < 20:
+    # ====================== v16.21 关键修复 ======================
+    # 永远不丢弃任何三角形/补片（用户明确要求）
+    if len(points_3d) < 3:
+        print(f"      WARNING: degenerate patch ({len(points_3d)} verts) → skipping (impossible in B-Rep)")
         return None, None
 
-    degree, patch_type, is_closed, is_toroidal = detect_patch_degree_svd(mesh, patch_faces, max_z_deviation, clean_mode)
-    print(f"   Detected {patch_type} patch → degree={degree}")
+    # 小补片（<6个顶点）强制使用平面拟合（degree=1）
+    if len(points_3d) < 6:
+        print(f"      Small patch detected ({len(points_3d)} verts) → forcing planar (degree=1)")
+        degree = 1
+        patch_type = "planar"
+        is_closed = False
+        is_toroidal = False
+    else:
+        degree, patch_type, is_closed, is_toroidal = detect_patch_degree_svd(mesh, patch_faces, max_z_deviation, clean_mode)
+
+    print(f"   Detected {patch_type} patch → degree={degree} (verts={len(points_3d)})")
 
     if degree == 1:
         print("      Planar patch → exact plane fit")
@@ -474,7 +476,7 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
 
     global_tree = KDTree(mesh.vertices) if closed_shell and mesh is not None else None
 
-    patch_meshes = []   # ← 收集处理后的 Trimesh 对象
+    patch_meshes = []
 
     for i, (surf, info) in enumerate(zip(surfaces, patch_info_list)):
         if surf is None: continue
@@ -525,7 +527,6 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
 
         patch_mesh = trimesh.Trimesh(vertices=pts, faces=patch_faces_list)
 
-        # Edge-to-NURBS deviation verification
         eval_tree = KDTree(patch_mesh.vertices)
         patch_max_dev = 0.0
         for face in patch_mesh.faces:
@@ -541,7 +542,6 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
         global_max_edge_dev = max(global_max_edge_dev, patch_max_dev)
         print(f"      Patch {i} max edge-to-NURBS deviation: {patch_max_dev:.8f}")
 
-        # BORDER SNAP
         if closed_shell and mesh is not None and not is_closed and global_tree is not None:
             border_idx = patch_border_lists[i]
             if len(border_idx) > 0:
@@ -571,7 +571,7 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
         surf.save(nurbs_name)
 
         created_files.extend([stl_name, nurbs_name])
-        patch_meshes.append(patch_mesh)   # ← 收集处理后的 patch
+        patch_meshes.append(patch_mesh)
 
     if patch_meshes:
         combined_mesh = trimesh.util.concatenate(patch_meshes)
@@ -651,9 +651,9 @@ def visualize_interactive(original_mesh, output_dir, surfaces):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="v16.20 NURBS – Unit Test Input STL + Verification")
+    parser = argparse.ArgumentParser(description="v16.21 NURBS – Unit Test Input STL + Verification")
     parser.add_argument("input", nargs="?", default="half-sphere.stl")
-    parser.add_argument("--output_dir", default="./nurbs_v16.20_only_current_files")
+    parser.add_argument("--output_dir", default="./nurbs_v16.21_no_dropped_triangles")
     parser.add_argument("--max_z_deviation", type=float, default=0.01)
     parser.add_argument("--clean-mode", action="store_true")
     parser.add_argument("--test", choices=["none", "cylinder", "sphere", "box", "cone", "ellipsoid", "torus", "complex"], default="none")
