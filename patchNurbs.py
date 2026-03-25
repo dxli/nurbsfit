@@ -43,26 +43,51 @@ def is_closed_shell(mesh):
 
 # ====================== 其余函数保持不变 ======================
 def region_growing_patches(mesh, clean_mode=False):
-    if clean_mode:
-        angle_threshold_deg = 10.0
-        feature_angle_deg = 15.0
-        curv_threshold_deg = 8.0
-    else:
-        angle_threshold_deg = 25.0
-        feature_angle_deg = 40.0
-        curv_threshold_deg = 15.0
+    """Adaptive region growing with FULL COVERAGE guarantee (no holes on final surface).
+    Tolerances scale to global mesh statistics. All faces are assigned to a patch."""
+    closed_shell = getattr(mesh, 'is_watertight', False)
 
+    # === GLOBAL STATISTICS (scale-invariant) ===
     normals = mesh.face_normals
     adjacency = mesh.face_adjacency
     dot_products = np.sum(normals[adjacency[:, 0]] * normals[adjacency[:, 1]], axis=1)
     dihedral = np.arccos(np.clip(dot_products, -1.0, 1.0))
 
-    curv_proxy = np.zeros(len(mesh.faces))
+    curv_proxy = np.zeros(len(mesh.faces), dtype=float)
     np.add.at(curv_proxy, adjacency[:, 0], dihedral)
     np.add.at(curv_proxy, adjacency[:, 1], dihedral)
     counts = np.bincount(adjacency.flatten(), minlength=len(mesh.faces))
     curv_proxy /= np.maximum(1, counts)
 
+    global_mean_curv = np.mean(curv_proxy)
+    global_std_curv  = np.std(curv_proxy)
+    mesh_diameter    = np.max(np.ptp(mesh.vertices, axis=0))
+
+    print(f"      Adaptive patch growing stats: mean_curv={np.rad2deg(global_mean_curv):.2f}° "
+          f"std_curv={np.rad2deg(global_std_curv):.2f}° diameter={mesh_diameter:.1f}")
+
+    # === ADAPTIVE THRESHOLDS ===
+    if clean_mode:
+        base_angle = 12.0 if closed_shell else 10.0
+        base_feature = 18.0 if closed_shell else 15.0
+        base_curv = 12.0 if closed_shell else 8.0
+    else:
+        base_angle = 25.0
+        base_feature = 40.0
+        base_curv = 15.0
+
+    scale_factor = 1.0 + 2.0 * (global_std_curv / (global_mean_curv + 1e-6))
+    if closed_shell and global_std_curv < np.deg2rad(5.0):   # very smooth closed shape
+        scale_factor = max(scale_factor, 1.8)
+
+    angle_threshold_deg = min(base_angle * scale_factor, 35.0)
+    feature_angle_deg   = min(base_feature * scale_factor, 45.0)
+    curv_threshold_deg  = min(base_curv * scale_factor, 25.0)
+
+    print(f"      Adaptive tolerances (scale={scale_factor:.2f}): "
+          f"angle={angle_threshold_deg:.1f}° feature={feature_angle_deg:.1f}° curv={curv_threshold_deg:.1f}°")
+
+    # === GROWING (no min-size filter) ===
     adj_list = [[] for _ in range(len(mesh.faces))]
     for a, b in adjacency:
         adj_list[a].append(b)
@@ -89,11 +114,33 @@ def region_growing_patches(mesh, clean_mode=False):
                     curv_diff < np.deg2rad(curv_threshold_deg)):
                     visited[n] = True
                     stack.append(n)
-        if len(patch) >= 30:
-            patches.append(patch)
-    print(f"✅ Created {len(patches)} B-Rep-aware patches {'(PRECISE MODE)' if clean_mode else ''}")
-    return patches, dihedral
+        patches.append(patch)   # ← ALL patches kept (even tiny ones)
 
+    # === FULL-COVERAGE CLEANUP: assign any remaining unvisited faces ===
+    unvisited = np.where(~visited)[0]
+    if len(unvisited) > 0:
+        print(f"      Cleanup: assigning {len(unvisited)} unvisited faces to nearest patches (no holes)")
+        face_to_patch = np.full(len(mesh.faces), -1, dtype=int)
+        for pid, pfaces in enumerate(patches):
+            face_to_patch[pfaces] = pid
+
+        for f in unvisited:
+            for n in adj_list[f]:
+                if face_to_patch[n] != -1:
+                    patches[face_to_patch[n]].append(f)
+                    visited[f] = True
+                    face_to_patch[f] = face_to_patch[n]
+                    break
+            else:
+                # truly isolated face → create singleton patch (rare)
+                patches.append([f])
+                visited[f] = True
+
+    mode_str = f"{'PRECISE (clean)' if clean_mode else 'NORMAL'}"
+    if closed_shell:
+        mode_str += " + ADAPTIVE CLOSED-SHELL + NO-HOLES"
+    print(f"✅ Created {len(patches)} B-Rep-aware patches ({mode_str}) – 100% coverage guaranteed")
+    return patches, dihedral
 
 def build_patch_adjacency(mesh, patches, dihedral, closed_shell=False):
     face_to_patch = np.full(len(mesh.faces), -1, dtype=int)

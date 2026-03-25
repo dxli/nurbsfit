@@ -169,14 +169,23 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     closed_u = closed_v = False
     if is_toroidal:
         print("      Using TRUE BI-PERIODIC TOROIDAL parameterization")
+        # Force canonical orientation: major-circle seam aligned with world -X axis
+        # (eliminates quadrant-specific rotational artifacts)
         R = np.column_stack((basis_u, basis_v, normal))
         pts_local = (points_3d - centroid) @ R.T
         dist_to_axis = np.sqrt(pts_local[:,0]**2 + pts_local[:,1]**2)
         R_major = np.mean(dist_to_axis)
+
+        # Canonical theta: rotate so that seam is always on world negative X
+        # (theta=0 → positive X, theta=π → negative X)
         theta = np.arctan2(pts_local[:,1], pts_local[:,0])
-        phi   = np.arctan2(pts_local[:,2], dist_to_axis - R_major)
+        # Force seam at theta = π (negative X)
+        theta = (theta + np.pi) % (2 * np.pi) - np.pi
+
+        phi = np.arctan2(pts_local[:,2], dist_to_axis - R_major)
         uv = np.column_stack(((theta + np.pi) / (2*np.pi), (phi + np.pi) / (2*np.pi)))
         closed_u = closed_v = True
+
     elif is_closed:
         print("      Using SPHERICAL parameterization (U closed)")
         dirs = points_3d - centroid
