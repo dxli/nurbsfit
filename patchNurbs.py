@@ -1,18 +1,17 @@
 """
-✅ COMPLETE PRODUCTION-READY v16.26 – NURBS Patch Fitting from STL
+✅ COMPLETE PRODUCTION-READY v16.28 – NURBS Patch Fitting from STL
 
-功能亮点（已全部合并 + 拟合质量提升）：
+功能亮点（已全部合并 + 球面拟合质量大幅提升）：
 • B-Rep-aware 区域生长分片 + 全方向邻接
 • SVD自动判断度数 + 小补片强制平面
-• 完整UV参数化：局部坐标系 + 双向闭合（U/V独立）+ 自适应网格
-• 控制点正确包裹 + 可靠clamped knot向量
-• 拟合质量提升：闭合曲面最低64×64网格 + cubic插值 + 自动质量提升循环
-• export_surfaces使用实际evaluation grid尺寸（解决UV mismatch）
+• 完整UV参数化：局部坐标系 + 双向闭合 + 自适应网格 + 质量提升循环
+• 球面极点强制塌陷（解决polar area缺失）
+• 球面/环面最低96×96网格 + 更激进质量提升循环（Z-dev ≤ 0.01）
+• export_surfaces使用实际collapsed极点生成fan三角形
 • 边界snap + 全局watertight验证
-• 全面修订注释（易读、生产级）
 
 === 使用方法 ===
-python patchNurbs.py --test complex
+python patchNurbs.py --test sphere
 python patchNurbs.py your_mesh.stl
 """
 
@@ -124,9 +123,9 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     Critical for mesh-to-NURBS fitting:
       • Automatic degree detection + adaptive grid (degree-aware, diameter-scaled)
       • Bi-directional closure (U/V independent) for spheres & tori
-      • Local-frame toroidal UVs + clamped knots (geomdl-safe, exact length)
-      • QUALITY BOOST: auto-increase grid + re-fit if Z-dev > target
-      • Guarantees target Z-deviation while keeping control nets compact
+      • Explicit pole collapse for spherical patches (fixes missing polar areas)
+      • Local-frame toroidal UVs + clamped knots (geomdl-safe)
+      • QUALITY BOOST: auto-increase grid + re-fit if Z-dev > target (v16.28)
     """
     faces = mesh.faces[patch_faces]
     vert_idx = np.unique(faces)
@@ -220,15 +219,15 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     uv = (uv - uv_min) / uv_range
 
     # ===================================================================
-    # 3. Adaptive grid size – IMPROVED QUALITY (v16.26)
+    # 3. Adaptive grid size – IMPROVED QUALITY (v16.28)
     # ===================================================================
     base_size = {1: 8, 2: 16, 3: 32}[degree]
     if closed_u or closed_v:
-        base_size = max(base_size, 64)                  # QUALITY BOOST for spheres/tori
+        base_size = max(base_size, 96)                  # SPHERE FIX: much larger starting grid
     patch_diameter = np.max(np.ptp(points_3d, axis=0))
     diameter_factor = min(3.0, patch_diameter / 40.0)
     grid_size = int(base_size * diameter_factor)
-    grid_size = max(16, min(128, grid_size))
+    grid_size = max(32, min(128, grid_size))
 
     print(f"      Adaptive grid → {grid_size}×{grid_size} (degree={degree}, closed_u={closed_u}, closed_v={closed_v})")
 
@@ -237,7 +236,7 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     grid_3d = np.nan_to_num(grid_3d, nan=0.0)
 
     # ===================================================================
-    # 4. Build NURBS with proper wrapping
+    # 4. Build NURBS with proper wrapping + EXPLICIT POLE COLLAPSE
     # ===================================================================
     surf = Surface()
     surf.degree_u = degree
@@ -253,8 +252,12 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
         surf.ctrlpts_size_u = grid_size + 1
         surf.ctrlpts_size_v = grid_size + 1
         surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
-    elif closed_u:                                     # spherical
+    elif closed_u:                                     # spherical – explicit pole collapse
         g = grid_3d.reshape(grid_size, grid_size, 3)
+        south_pole = g[0, 0]
+        north_pole = g[-1, 0]
+        g[0, :] = south_pole
+        g[-1, :] = north_pole
         grid_closed = np.zeros((grid_size, grid_size + 1, 3))
         grid_closed[:, :grid_size] = g
         grid_closed[:, grid_size]  = g[:, 0]
@@ -279,12 +282,12 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     surf.delta = (0.01, 0.01)
 
     # ===================================================================
-    # 6. Reparameterization loop + QUALITY BOOST (v16.26)
+    # 6. Reparameterization loop + QUALITY BOOST (v16.28)
     # ===================================================================
-    max_passes = 3
+    max_passes = 5
     for pass_num in range(max_passes):
         print(f"      Quality pass {pass_num+1}/{max_passes} (grid={grid_size})")
-        for it in range(15):
+        for it in range(25):   # increased iterations per pass
             eval_pts = np.array(surf.evalpts)
             tree = KDTree(eval_pts)
             _, idx = tree.query(points_3d)
@@ -300,8 +303,12 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
                 grid_closed[-1, :-1]  = g[0, :]
                 grid_closed[-1, -1]   = g[0, 0]
                 surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
-            elif closed_u:
+            elif closed_u:   # re-collapse poles every iteration
                 g = new_grid_3d.reshape(grid_size, grid_size, 3)
+                south_pole = g[0, 0]
+                north_pole = g[-1, 0]
+                g[0, :] = south_pole
+                g[-1, :] = north_pole
                 grid_closed = np.zeros((grid_size, grid_size + 1, 3))
                 grid_closed[:, :grid_size] = g
                 grid_closed[:, grid_size]  = g[:, 0]
@@ -324,7 +331,7 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
         if z_dev <= max_z_deviation:
             break
         if pass_num < max_passes - 1:
-            grid_size = min(128, int(grid_size * 1.5))
+            grid_size = min(128, int(grid_size * 2.0))   # more aggressive growth
             print(f"      Z-dev still {z_dev:.6f} → increasing grid to {grid_size} and re-fitting")
             grid_uv = np.mgrid[0:1:complex(0, grid_size), 0:1:complex(0, grid_size)].reshape(2, -1).T
             grid_3d = griddata(uv, points_3d, grid_uv, method='cubic')
@@ -345,6 +352,10 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
                 surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
             elif closed_u:
                 g = grid_3d.reshape(grid_size, grid_size, 3)
+                south_pole = g[0, 0]
+                north_pole = g[-1, 0]
+                g[0, :] = south_pole
+                g[-1, :] = north_pole
                 grid_closed = np.zeros((grid_size, grid_size + 1, 3))
                 grid_closed[:, :grid_size] = g
                 grid_closed[:, grid_size]  = g[:, 0]
@@ -547,17 +558,15 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
     Critical for mesh-to-NURBS fitting:
       • Inherits exact UV parameterization from adaptive_fit_nurbs_to_patch()
       • Uses actual evaluation grid size (from delta) for mesh topology
+      • Robust pole fans for spherical patches (explicit collapse enforced)
       • Guarantees watertight output even on toroidal/spherical patches
     """
     os.makedirs(output_dir, exist_ok=True)
-    print("\n=== GENERATING STL + NATIVE NURBS + COMBINED CLOSED STL (v16.26) ===")
+    print("\n=== GENERATING STL + NATIVE NURBS + COMBINED CLOSED STL (v16.28) ===")
 
     created_files = []
     global_max_edge_dev = 0.0
 
-    # ===================================================================
-    # 1. Precompute border vertices for closed-shell snapping
-    # ===================================================================
     patch_border_lists = []
     if closed_shell and mesh is not None and vertex_patches is not None:
         print("      Precomputing border vertices using vertex adjacency...")
@@ -573,9 +582,6 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
     global_tree = KDTree(mesh.vertices) if closed_shell and mesh is not None else None
     patch_meshes = []
 
-    # ===================================================================
-    # 2. Per-patch export loop
-    # ===================================================================
     for i, (surf, info) in enumerate(zip(surfaces, patch_info_list)):
         if surf is None:
             continue
@@ -587,15 +593,12 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
         print(f"      Patch {i} | toroidal={is_toroidal} | closed_u={closed_u} | closed_v={closed_v} | "
               f"UV-grid {surf.ctrlpts_size_u}×{surf.ctrlpts_size_v}")
 
-        surf.delta = (0.025, 0.025)
+        surf.delta = (0.015, 0.015)   # slightly denser for polar coverage
         pts = np.array(surf.evalpts)
         cu = surf.ctrlpts_size_u
         cv = surf.ctrlpts_size_v
         num_points = len(pts)
 
-        # ===================================================================
-        # Compute ACTUAL evaluation grid size (from delta sampling)
-        # ===================================================================
         n = int(np.sqrt(num_points) + 0.5)
         rows, cols = n, n
         print(f"      UV evalpts generated: {num_points} ({rows}×{cols})")
@@ -633,8 +636,8 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
                 patch_faces_list.append([a, b, d])
                 patch_faces_list.append([a, d, cc])
 
-        if closed_u and not closed_v:
-            print("      Adding spherical pole fans")
+        if closed_u and not closed_v:   # spherical pole fans – now robust
+            print("      Adding spherical pole fans (south + north)")
             pole_s = 0
             for c in range(cols - 1):
                 a = pole_s
@@ -783,9 +786,9 @@ def visualize_interactive(original_mesh, output_dir, surfaces):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="v16.26 NURBS – Unit Test Input STL + Verification")
+    parser = argparse.ArgumentParser(description="v16.28 NURBS – Unit Test Input STL + Verification")
     parser.add_argument("input", nargs="?", default="half-sphere.stl")
-    parser.add_argument("--output_dir", default="./nurbs_v16.26_final")
+    parser.add_argument("--output_dir", default="./nurbs_v16.28_sphere_fixed")
     parser.add_argument("--max_z_deviation", type=float, default=0.01)
     parser.add_argument("--clean-mode", action="store_true")
     parser.add_argument("--test", choices=["none", "cylinder", "sphere", "box", "cone", "ellipsoid", "torus", "complex"], default="none")
