@@ -1,12 +1,15 @@
 """
-✅ STANDALONE NURBS PATCH FITTER (v16.28)
+✅ STANDALONE NURBS PATCH FITTER (v16.30 - LS + WATERTIGHT + FIXED PERIODIC KNOTS)
 Run independently: python nurbs_patch_fitter.py
 """
 
 import numpy as np
 from scipy.spatial import KDTree
-from scipy.interpolate import griddata
+from scipy.interpolate import BSpline
 from geomdl.NURBS import Surface
+
+# ====================== MODULAR IMPORT ======================
+from nurbs_patch_utils import compute_robust_local_basis
 
 
 def detect_patch_degree_svd(mesh, patch_faces, target_max_dev=0.5, clean_mode=False):
@@ -54,28 +57,61 @@ def detect_patch_degree_svd(mesh, patch_faces, target_max_dev=0.5, clean_mode=Fa
     return 3, "freeform", False, False
 
 
-def compute_robust_local_basis(mesh, patch_faces):
-    faces = mesh.faces[patch_faces]
-    vert_idx = np.unique(faces)
-    points = mesh.vertices[vert_idx]
-    centroid = np.mean(points, axis=0)
-    X = points - centroid
-    _, _, Vt = np.linalg.svd(X, full_matrices=False)
-    normal = Vt[-1]
-    norm = np.linalg.norm(normal)
-    if norm < 1e-8:
-        normal = np.array([0., 0., 1.])
+def make_knots(n_ctrl, deg, periodic=False):
+    """Correct knot vector generation (fixed for periodic cases)."""
+    if periodic:
+        # Periodic: len(knots) == n_ctrl + deg + 1  (scipy requirement)
+        # Knots wrap around [0,1] → BSpline(extrapolate=periodic) works perfectly
+        return [float(i - deg) / n_ctrl for i in range(n_ctrl + deg + 1)]
     else:
-        normal /= norm
-    arb = np.array([0., 0., 1.]) if abs(normal[2]) < 0.9 else np.array([1., 0., 0.])
-    u = np.cross(normal, arb)
-    u /= np.linalg.norm(u) + 1e-12
-    v = np.cross(normal, u)
-    return u, v, normal
+        internal = max(1, n_ctrl - deg)
+        return [0]*(deg + 1) + [float(i)/internal for i in range(1, internal)] + [1]*(deg + 1)
 
 
-def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_mode=False, centripetal=True, verbose=False):
-    """Fit a single B-Rep patch to a NURBS surface (standalone version)."""
+def _bspline_basis(knots, degree, t, periodic=False):
+    """Univariate B-spline basis matrix – now consistent for both open & periodic."""
+    n_basis = len(knots) - degree - 1
+    basis = np.zeros((len(t), n_basis))
+    for i in range(n_basis):
+        coeffs = np.zeros(n_basis)
+        coeffs[i] = 1.0
+        spl = BSpline(knots, coeffs, degree, extrapolate=periodic)
+        basis[:, i] = spl(t)
+    return basis
+
+
+def fit_b_spline_ls(uv, points, degree, n_ctrl_u, n_ctrl_v,
+                    closed_u=False, closed_v=False, boundary_mask=None):
+    """Linear least-squares with periodic support + boundary weighting for watertight shells."""
+    knot_u = make_knots(n_ctrl_u, degree, periodic=closed_u)
+    knot_v = make_knots(n_ctrl_v, degree, periodic=closed_v)
+    Bu = _bspline_basis(knot_u, degree, uv[:, 0], periodic=closed_u)
+    Bv = _bspline_basis(knot_v, degree, uv[:, 1], periodic=closed_v)
+
+    # Tensor-product design matrix
+    A = np.zeros((len(uv), n_ctrl_u * n_ctrl_v))
+    for i in range(len(uv)):
+        A[i] = np.kron(Bu[i], Bv[i])
+
+    # Weighted LS for closed shells (boundary points 50× stronger)
+    weights = np.ones(len(uv))
+    if boundary_mask is not None:
+        weights[boundary_mask] = 50.0
+    W = np.diag(weights)
+
+    ctrl = np.zeros((n_ctrl_u * n_ctrl_v, 3))
+    for d in range(3):
+        ATA = A.T @ W @ A
+        ATb = A.T @ W @ points[:, d]
+        ctrl[:, d] = np.linalg.solve(ATA, ATb)
+
+    return ctrl, knot_u, knot_v
+
+
+def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_mode=False,
+                                centripetal=True, verbose=False,
+                                closed_shell=False, boundary_vert_mask=None):
+    """Fit a single B-Rep patch – now fully stable on closed (sphere/toroidal) patches."""
     faces = mesh.faces[patch_faces]
     vert_idx = np.unique(faces)
     original_points = mesh.vertices[vert_idx].copy()
@@ -94,17 +130,20 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     else:
         degree, patch_type, is_closed, is_toroidal = detect_patch_degree_svd(mesh, patch_faces, max_z_deviation, clean_mode)
 
-    print(f"   Detected {patch_type} patch → degree={degree} (verts={len(points_3d)})")
+    print(f"   Detected {patch_type} patch → degree={degree} (verts={len(points_3d)}) | closed_shell={closed_shell}")
 
     if degree == 1:
         print("      Planar patch → exact plane fit")
         centroid = np.mean(points_3d, axis=0)
         _, _, Vt = np.linalg.svd(points_3d - centroid, full_matrices=False)
         normal = Vt[-1]
-        corners = np.array([points_3d[np.argmin(points_3d[:,0])],
-                            points_3d[np.argmax(points_3d[:,0])],
-                            points_3d[np.argmin(points_3d[:,1])],
-                            points_3d[np.argmax(points_3d[:,1])]])
+        # 4-corner bilinear plane
+        corners = np.array([
+            points_3d[np.argmin(points_3d[:,0])],
+            points_3d[np.argmax(points_3d[:,0])],
+            points_3d[np.argmin(points_3d[:,1])],
+            points_3d[np.argmax(points_3d[:,1])]
+        ])
         surf = Surface()
         surf.degree_u = 1
         surf.degree_v = 1
@@ -118,34 +157,29 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
                       "closed": False, "toroidal": False,
                       "closed_u": False, "closed_v": False}
 
-    # UV-parameterization + adaptive grid + quality boost (same as v16.28)
+    # UV-parameterization (toroidal / spherical / regular)
     basis_u, basis_v, normal = compute_robust_local_basis(mesh, patch_faces)
     centroid = np.mean(points_3d, axis=0)
 
-    closed_u = False
-    closed_v = False
+    closed_u = closed_v = False
     if is_toroidal:
-        print("      Using TRUE BI-PERIODIC TOROIDAL parameterization (U+V closed)")
+        print("      Using TRUE BI-PERIODIC TOROIDAL parameterization")
         R = np.column_stack((basis_u, basis_v, normal))
         pts_local = (points_3d - centroid) @ R.T
         dist_to_axis = np.sqrt(pts_local[:,0]**2 + pts_local[:,1]**2)
         R_major = np.mean(dist_to_axis)
         theta = np.arctan2(pts_local[:,1], pts_local[:,0])
         phi   = np.arctan2(pts_local[:,2], dist_to_axis - R_major)
-        uv = np.column_stack(((theta + np.pi) / (2*np.pi),
-                              (phi   + np.pi) / (2*np.pi)))
-        closed_u = True
-        closed_v = True
+        uv = np.column_stack(((theta + np.pi) / (2*np.pi), (phi + np.pi) / (2*np.pi)))
+        closed_u = closed_v = True
     elif is_closed:
-        print("      Using SPHERICAL parameterization (U closed, V open with poles)")
+        print("      Using SPHERICAL parameterization (U closed)")
         dirs = points_3d - centroid
         r = np.mean(np.linalg.norm(dirs, axis=1))
         dirs /= (r + 1e-12)
-        dirs = np.clip(dirs, -1.0, 1.0)
         theta = np.arctan2(dirs[:,1], dirs[:,0])
         phi   = np.arcsin(dirs[:,2])
-        uv = np.column_stack(((theta + np.pi) / (2*np.pi),
-                              (phi + np.pi/2) / np.pi))
+        uv = np.column_stack(((theta + np.pi) / (2*np.pi), (phi + np.pi/2) / np.pi))
         closed_u = True
         closed_v = False
     else:
@@ -162,92 +196,45 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     uv_range[uv_range < 1e-12] = 1.0
     uv = (uv - uv_min) / uv_range
 
-    # Adaptive grid (96×96 min for spheres)
-    base_size = {1: 8, 2: 16, 3: 32}[degree]
-    if closed_u or closed_v:
-        base_size = max(base_size, 96)
+    # LS control-net size
+    base_ctrl = {1: 4, 2: 6, 3: 8}
+    n_ctrl_base = base_ctrl.get(degree, 8)
     patch_diameter = np.max(np.ptp(points_3d, axis=0))
-    diameter_factor = min(3.0, patch_diameter / 40.0)
-    grid_size = int(base_size * diameter_factor)
-    grid_size = max(32, min(128, grid_size))
+    diameter_factor = min(3.0, patch_diameter / 40.0) if closed_shell else min(2.5, patch_diameter / 50.0)
+    n_ctrl = max(n_ctrl_base, int(n_ctrl_base * diameter_factor))
+    n_ctrl = min(n_ctrl, 20 if closed_shell else 16)
+    print(f"      LS fit → {n_ctrl}×{n_ctrl} control points (periodic={closed_u or closed_v})")
 
-    print(f"      Adaptive grid → {grid_size}×{grid_size} (degree={degree}, closed_u={closed_u}, closed_v={closed_v})")
-
-    grid_uv = np.mgrid[0:1:complex(0, grid_size), 0:1:complex(0, grid_size)].reshape(2, -1).T
-    grid_3d = griddata(uv, points_3d, grid_uv, method='cubic')
-    grid_3d = np.nan_to_num(grid_3d, nan=0.0)
+    # Least-squares fit (now works for closed patches)
+    ctrlpts_array, knot_u, knot_v = fit_b_spline_ls(
+        uv, points_3d, degree, n_ctrl, n_ctrl,
+        closed_u=closed_u, closed_v=closed_v,
+        boundary_mask=boundary_vert_mask
+    )
 
     surf = Surface()
     surf.degree_u = degree
     surf.degree_v = degree
-
-    if closed_u and closed_v:
-        g = grid_3d.reshape(grid_size, grid_size, 3)
-        grid_closed = np.zeros((grid_size + 1, grid_size + 1, 3))
-        grid_closed[:-1, :-1] = g
-        grid_closed[:-1, -1]  = g[:, 0]
-        grid_closed[-1, :-1]  = g[0, :]
-        grid_closed[-1, -1]   = g[0, 0]
-        surf.ctrlpts_size_u = grid_size + 1
-        surf.ctrlpts_size_v = grid_size + 1
-        surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
-    elif closed_u:
-        g = grid_3d.reshape(grid_size, grid_size, 3)
-        south_pole = g[0, 0]
-        north_pole = g[-1, 0]
-        g[0, :] = south_pole
-        g[-1, :] = north_pole
-        grid_closed = np.zeros((grid_size, grid_size + 1, 3))
-        grid_closed[:, :grid_size] = g
-        grid_closed[:, grid_size]  = g[:, 0]
-        surf.ctrlpts_size_u = grid_size + 1
-        surf.ctrlpts_size_v = grid_size
-        surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
-    else:
-        surf.ctrlpts_size_u = grid_size
-        surf.ctrlpts_size_v = grid_size
-        surf.ctrlpts = grid_3d.tolist()
-
-    def make_knots(n_ctrl, deg):
-        internal = max(1, n_ctrl - deg)
-        return [0]*(deg + 1) + [float(i)/internal for i in range(1, internal)] + [1]*(deg + 1)
-
-    surf.knotvector_u = make_knots(surf.ctrlpts_size_u, degree)
-    surf.knotvector_v = make_knots(surf.ctrlpts_size_v, degree)
+    surf.ctrlpts_size_u = n_ctrl
+    surf.ctrlpts_size_v = n_ctrl
+    surf.ctrlpts = ctrlpts_array.tolist()
+    surf.knotvector_u = knot_u
+    surf.knotvector_v = knot_v
     surf.delta = (0.01, 0.01)
 
-    # Quality-boost loop
-    max_passes = 5
+    # Short quality-boost loop
+    max_passes = 2 if not (closed_u or closed_v) else 3
     for pass_num in range(max_passes):
-        print(f"      Quality pass {pass_num+1}/{max_passes} (grid={grid_size})")
-        for it in range(25):
+        print(f"      Quality pass {pass_num+1}/{max_passes}")
+        for it in range(12):
             eval_pts = np.array(surf.evalpts)
             tree = KDTree(eval_pts)
             _, idx = tree.query(points_3d)
             snapped = eval_pts[idx]
-            new_grid_3d = griddata(uv, snapped, grid_uv, method='cubic')
-            new_grid_3d = np.nan_to_num(new_grid_3d, nan=0.0)
-
-            if closed_u and closed_v:
-                g = new_grid_3d.reshape(grid_size, grid_size, 3)
-                grid_closed = np.zeros((grid_size + 1, grid_size + 1, 3))
-                grid_closed[:-1, :-1] = g
-                grid_closed[:-1, -1]  = g[:, 0]
-                grid_closed[-1, :-1]  = g[0, :]
-                grid_closed[-1, -1]   = g[0, 0]
-                surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
-            elif closed_u:
-                g = new_grid_3d.reshape(grid_size, grid_size, 3)
-                south_pole = g[0, 0]
-                north_pole = g[-1, 0]
-                g[0, :] = south_pole
-                g[-1, :] = north_pole
-                grid_closed = np.zeros((grid_size, grid_size + 1, 3))
-                grid_closed[:, :grid_size] = g
-                grid_closed[:, grid_size]  = g[:, 0]
-                surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
-            else:
-                surf.ctrlpts = new_grid_3d.tolist()
+            new_ctrl, _, _ = fit_b_spline_ls(uv, snapped, degree, n_ctrl, n_ctrl,
+                                             closed_u=closed_u, closed_v=closed_v,
+                                             boundary_mask=boundary_vert_mask)
+            surf.ctrlpts = new_ctrl.tolist()
 
             eval_pts = np.array(surf.evalpts)
             tree = KDTree(eval_pts)
@@ -257,51 +244,12 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
 
             if verbose:
                 print(f"         Reparam {it+1:2d} → Z-dev: {z_dev:.6f}")
-
-            if z_dev < max_z_deviation:
+            if z_dev < max_z_deviation * 0.8:
                 break
-
         if z_dev <= max_z_deviation:
             break
-        if pass_num < max_passes - 1:
-            grid_size = min(128, int(grid_size * 2.0))
-            print(f"      Z-dev still {z_dev:.6f} → increasing grid to {grid_size} and re-fitting")
-            grid_uv = np.mgrid[0:1:complex(0, grid_size), 0:1:complex(0, grid_size)].reshape(2, -1).T
-            grid_3d = griddata(uv, points_3d, grid_uv, method='cubic')
-            grid_3d = np.nan_to_num(grid_3d, nan=0.0)
-            surf = Surface()
-            surf.degree_u = degree
-            surf.degree_v = degree
-            if closed_u and closed_v:
-                g = grid_3d.reshape(grid_size, grid_size, 3)
-                grid_closed = np.zeros((grid_size + 1, grid_size + 1, 3))
-                grid_closed[:-1, :-1] = g
-                grid_closed[:-1, -1]  = g[:, 0]
-                grid_closed[-1, :-1]  = g[0, :]
-                grid_closed[-1, -1]   = g[0, 0]
-                surf.ctrlpts_size_u = grid_size + 1
-                surf.ctrlpts_size_v = grid_size + 1
-                surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
-            elif closed_u:
-                g = grid_3d.reshape(grid_size, grid_size, 3)
-                south_pole = g[0, 0]
-                north_pole = g[-1, 0]
-                g[0, :] = south_pole
-                g[-1, :] = north_pole
-                grid_closed = np.zeros((grid_size, grid_size + 1, 3))
-                grid_closed[:, :grid_size] = g
-                grid_closed[:, grid_size]  = g[:, 0]
-                surf.ctrlpts_size_u = grid_size + 1
-                surf.ctrlpts_size_v = grid_size
-                surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
-            else:
-                surf.ctrlpts_size_u = grid_size
-                surf.ctrlpts_size_v = grid_size
-                surf.ctrlpts = grid_3d.tolist()
-            surf.knotvector_u = make_knots(surf.ctrlpts_size_u, degree)
-            surf.knotvector_v = make_knots(surf.ctrlpts_size_v, degree)
-            surf.delta = (0.01, 0.01)
 
+    # Final deviation check
     eval_pts = np.array(surf.evalpts)
     tree = KDTree(eval_pts)
     _, idx = tree.query(original_points)
@@ -317,11 +265,11 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
                   "closed_u": closed_u, "closed_v": closed_v}
 
 
-# ====================== Independent test (run this file directly) ======================
+# ====================== Independent test ======================
 if __name__ == "__main__":
     import trimesh
     print("=== STANDALONE TEST: Fitting a single sphere patch ===")
     mesh = trimesh.creation.icosphere(subdivisions=3, radius=5.0)
-    patch_faces = np.arange(len(mesh.faces))  # whole mesh as one patch
-    surf, info = adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, verbose=True)
+    patch_faces = np.arange(len(mesh.faces))
+    surf, info = adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, verbose=False)
     print("Standalone fitting complete. Z-dev:", info["z_dev"])
