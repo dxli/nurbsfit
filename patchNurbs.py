@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 
 
+
 # ====================== 验证辅助函数 ======================
 def compute_solid_angle_from_center(mesh, center):
     verts = mesh.vertices
@@ -119,28 +120,19 @@ def compute_robust_local_basis(mesh, patch_faces):
 
 def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_mode=False, centripetal=True, verbose=False):
     """Fit a single B-Rep patch to a NURBS surface with full UV-parameterization support.
-
-    Critical for mesh-to-NURBS fitting:
-      • Automatic degree detection + adaptive grid (degree-aware, diameter-scaled)
-      • Bi-directional closure (U/V independent) for spheres & tori
-      • Explicit pole collapse for spherical patches (fixes missing polar areas)
-      • Local-frame toroidal UVs + clamped knots (geomdl-safe)
-      • QUALITY BOOST: auto-increase grid + re-fit if Z-dev > target (v16.28)
+    v16.29: Spherical closed_u path now uses correct V-polar × U-azimuthal orientation.
     """
     faces = mesh.faces[patch_faces]
     vert_idx = np.unique(faces)
     original_points = mesh.vertices[vert_idx].copy()
     points_3d = original_points.copy()
 
-    # ===================================================================
-    # 1. v16.21 safety net (unchanged)
-    # ===================================================================
     if len(points_3d) < 3:
-        print(f"      WARNING: degenerate patch ({len(points_3d)} verts) → skipping (impossible in B-Rep)")
+        print(f"      WARNING: degenerate patch ({len(points_3d)} verts) → skipping")
         return None, None
 
     if len(points_3d) < 6:
-        print(f"      Small patch detected ({len(points_3d)} verts) → forcing planar (degree=1)")
+        print(f"      Small patch detected ({len(points_3d)} verts) → forcing planar")
         degree = 1
         patch_type = "planar"
         is_closed = False
@@ -172,16 +164,13 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
                       "closed": False, "toroidal": False,
                       "closed_u": False, "closed_v": False}
 
-    # ===================================================================
-    # 2. UV-parameterization (local basis + bi-directional closure)
-    # ===================================================================
     basis_u, basis_v, normal = compute_robust_local_basis(mesh, patch_faces)
     centroid = np.mean(points_3d, axis=0)
 
     closed_u = False
     closed_v = False
     if is_toroidal:
-        print("      Using TRUE BI-PERIODIC TOROIDAL parameterization (U+V closed)")
+        print("      Using TRUE BI-PERIODIC TOROIDAL parameterization")
         R = np.column_stack((basis_u, basis_v, normal))
         pts_local = (points_3d - centroid) @ R.T
         dist_to_axis = np.sqrt(pts_local[:,0]**2 + pts_local[:,1]**2)
@@ -218,12 +207,9 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     uv_range[uv_range < 1e-12] = 1.0
     uv = (uv - uv_min) / uv_range
 
-    # ===================================================================
-    # 3. Adaptive grid size – IMPROVED QUALITY (v16.28)
-    # ===================================================================
     base_size = {1: 8, 2: 16, 3: 32}[degree]
     if closed_u or closed_v:
-        base_size = max(base_size, 96)                  # SPHERE FIX: much larger starting grid
+        base_size = max(base_size, 96)
     patch_diameter = np.max(np.ptp(points_3d, axis=0))
     diameter_factor = min(3.0, patch_diameter / 40.0)
     grid_size = int(base_size * diameter_factor)
@@ -235,9 +221,6 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     grid_3d = griddata(uv, points_3d, grid_uv, method='cubic')
     grid_3d = np.nan_to_num(grid_3d, nan=0.0)
 
-    # ===================================================================
-    # 4. Build NURBS with proper wrapping + EXPLICIT POLE COLLAPSE
-    # ===================================================================
     surf = Surface()
     surf.degree_u = degree
     surf.degree_v = degree
@@ -252,8 +235,8 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
         surf.ctrlpts_size_u = grid_size + 1
         surf.ctrlpts_size_v = grid_size + 1
         surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
-    elif closed_u:                                     # spherical – explicit pole collapse
-        g = grid_3d.reshape(grid_size, grid_size, 3)
+    elif closed_u:                                     # spherical – v16.29 FIXED
+        g = grid_3d.reshape(grid_size, grid_size, 3).transpose(1, 0, 2)  # (V_polar, U_azimuthal)
         south_pole = g[0, 0]
         north_pole = g[-1, 0]
         g[0, :] = south_pole
@@ -261,33 +244,26 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
         grid_closed = np.zeros((grid_size, grid_size + 1, 3))
         grid_closed[:, :grid_size] = g
         grid_closed[:, grid_size]  = g[:, 0]
-        surf.ctrlpts_size_u = grid_size + 1
-        surf.ctrlpts_size_v = grid_size
+        surf.ctrlpts_size_u = grid_size + 1   # U closed (correct wrapping)
+        surf.ctrlpts_size_v = grid_size       # V open (poles)
         surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
     else:
         surf.ctrlpts_size_u = grid_size
         surf.ctrlpts_size_v = grid_size
         surf.ctrlpts = grid_3d.tolist()
 
-    # ===================================================================
-    # 5. Knot vectors – ALWAYS CLAMPED
-    # ===================================================================
     def make_knots(n_ctrl, deg):
         internal = max(1, n_ctrl - deg)
         return [0]*(deg + 1) + [float(i)/internal for i in range(1, internal)] + [1]*(deg + 1)
 
     surf.knotvector_u = make_knots(surf.ctrlpts_size_u, degree)
     surf.knotvector_v = make_knots(surf.ctrlpts_size_v, degree)
-
     surf.delta = (0.01, 0.01)
 
-    # ===================================================================
-    # 6. Reparameterization loop + QUALITY BOOST (v16.28)
-    # ===================================================================
     max_passes = 5
     for pass_num in range(max_passes):
         print(f"      Quality pass {pass_num+1}/{max_passes} (grid={grid_size})")
-        for it in range(25):   # increased iterations per pass
+        for it in range(25):
             eval_pts = np.array(surf.evalpts)
             tree = KDTree(eval_pts)
             _, idx = tree.query(points_3d)
@@ -303,8 +279,8 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
                 grid_closed[-1, :-1]  = g[0, :]
                 grid_closed[-1, -1]   = g[0, 0]
                 surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
-            elif closed_u:   # re-collapse poles every iteration
-                g = new_grid_3d.reshape(grid_size, grid_size, 3)
+            elif closed_u:   # v16.29 FIXED – re-collapse poles + re-wrap U-seam
+                g = new_grid_3d.reshape(grid_size, grid_size, 3).transpose(1, 0, 2)
                 south_pole = g[0, 0]
                 north_pole = g[-1, 0]
                 g[0, :] = south_pole
@@ -331,12 +307,12 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
         if z_dev <= max_z_deviation:
             break
         if pass_num < max_passes - 1:
-            grid_size = min(128, int(grid_size * 2.0))   # more aggressive growth
+            grid_size = min(128, int(grid_size * 2.0))
             print(f"      Z-dev still {z_dev:.6f} → increasing grid to {grid_size} and re-fitting")
             grid_uv = np.mgrid[0:1:complex(0, grid_size), 0:1:complex(0, grid_size)].reshape(2, -1).T
             grid_3d = griddata(uv, points_3d, grid_uv, method='cubic')
             grid_3d = np.nan_to_num(grid_3d, nan=0.0)
-            # rebuild surf with new grid
+
             surf = Surface()
             surf.degree_u = degree
             surf.degree_v = degree
@@ -350,8 +326,8 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
                 surf.ctrlpts_size_u = grid_size + 1
                 surf.ctrlpts_size_v = grid_size + 1
                 surf.ctrlpts = grid_closed.reshape(-1, 3).tolist()
-            elif closed_u:
-                g = grid_3d.reshape(grid_size, grid_size, 3)
+            elif closed_u:   # v16.29 FIXED – quality-boost rebuild
+                g = grid_3d.reshape(grid_size, grid_size, 3).transpose(1, 0, 2)
                 south_pole = g[0, 0]
                 north_pole = g[-1, 0]
                 g[0, :] = south_pole
@@ -370,9 +346,6 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
             surf.knotvector_v = make_knots(surf.ctrlpts_size_v, degree)
             surf.delta = (0.01, 0.01)
 
-    # ===================================================================
-    # 7. Final metrics
-    # ===================================================================
     eval_pts = np.array(surf.evalpts)
     tree = KDTree(eval_pts)
     _, idx = tree.query(original_points)
@@ -492,7 +465,7 @@ def build_patch_adjacency(mesh, patches, dihedral, closed_shell=False):
 
 def hierarchical_merge(surfaces, patch_info_list, patch_adj, dihedral_dict, mesh, patches, closed_shell=False):
     print("🔗 HIERARCHICAL MERGING (small → larger NURBS surfaces)...")
-    
+
     if len(surfaces) <= 1:
         print("      Single patch - no merge needed")
         return surfaces, patch_info_list
@@ -554,7 +527,7 @@ def hierarchical_merge(surfaces, patch_info_list, patch_adj, dihedral_dict, mesh
 
 def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, mesh=None, patch_adj=None, vertex_patches=None):
     """Export all fitted NURBS patches as STL + .json, plus a watertight combined STL.
-    
+
     Critical for mesh-to-NURBS fitting:
       • Inherits exact UV parameterization from adaptive_fit_nurbs_to_patch()
       • Uses actual evaluation grid size (from delta) for mesh topology
