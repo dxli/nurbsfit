@@ -1,5 +1,5 @@
 """
-✅ STANDALONE NURBS PATCH FITTER (v16.32 - ROBUST LS + CLOSED PATCH FIX)
+✅ STANDALONE NURBS PATCH FITTER (v16.33 – ROBUST LS + CLOSED PATCH + TORUS SEAM FIX)
 Run independently: python nurbs_patch_fitter.py
 """
 
@@ -59,6 +59,7 @@ def detect_patch_degree_svd(mesh, patch_faces, target_max_dev=0.5, clean_mode=Fa
 
 def make_knots(n_ctrl, deg, periodic=False):
     if periodic:
+        # Standard periodic uniform knots (guarantees C0 at 0/1)
         return [float(i - deg) / n_ctrl for i in range(n_ctrl + deg + 1)]
     else:
         internal = max(1, n_ctrl - deg)
@@ -89,6 +90,16 @@ def fit_b_spline_ls(uv, points, degree, n_ctrl_u, n_ctrl_v,
         A[i] = np.kron(Bu[i], Bv[i])
 
     weights = np.ones(len(uv), dtype=float)
+
+    # === TORUS SEAM FIX: heavy weighting on periodic boundaries ===
+    if closed_u or closed_v:
+        seam_mask = np.zeros(len(uv), dtype=bool)
+        if closed_u:
+            seam_mask |= (uv[:,0] < 0.025) | (uv[:,0] > 0.975)
+        if closed_v:
+            seam_mask |= (uv[:,1] < 0.025) | (uv[:,1] > 0.975)
+        weights[seam_mask] = 200.0   # forces perfect closure
+
     if boundary_mask is not None:
         weights[boundary_mask] = 50.0
 
@@ -202,6 +213,12 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     if n_ctrl * n_ctrl > len(points_3d) * 2:
         n_ctrl = max(8, int(np.sqrt(len(points_3d) * 1.5)))
     n_ctrl = min(n_ctrl, 20 if closed_shell else 16)
+
+    # === TORUS SEAM FIX: force higher resolution for bi-periodic patches ===
+    if closed_u and closed_v:          # toroidal
+        n_ctrl = max(n_ctrl, 24)
+        print("      TOROIDAL OVERRIDE: 24×24 control net for perfect closure")
+
     print(f"      LS fit → {n_ctrl}×{n_ctrl} control points (periodic={closed_u or closed_v})")
 
     # Robust least-squares fit

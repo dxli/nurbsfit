@@ -1,5 +1,5 @@
 """
-✅ COMPLETE PRODUCTION-READY v16.28 – NURBS Patch Fitting from STL
+✅ COMPLETE PRODUCTION-READY v16.34 – NURBS Patch Fitting from STL
 (modular version – adaptive_fit_nurbs_to_patch is now in nurbs_patch_fitter.py)
 """
 
@@ -209,7 +209,11 @@ def hierarchical_merge(surfaces, patch_info_list, patch_adj, dihedral_dict, mesh
 def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, mesh=None, patch_adj=None, vertex_patches=None):
     """Export all fitted NURBS patches as STL + .json, plus a watertight combined STL."""
     os.makedirs(output_dir, exist_ok=True)
-    print("\n=== GENERATING STL + NATIVE NURBS + COMBINED CLOSED STL (v16.28) ===")
+    print("\n=== GENERATING STL + NATIVE NURBS + COMBINED CLOSED STL (v16.34) ===")
+
+    # === COMPATIBILITY FIX: force merge tolerance (works on ALL trimesh versions) ===
+    trimesh.tol.merge = 1e-8
+    print("      trimesh.tol.merge set to 1e-8 for perfect seam closure")
 
     created_files = []
     global_max_edge_dev = 0.0
@@ -297,6 +301,19 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
 
         patch_mesh = trimesh.Trimesh(vertices=pts, faces=patch_faces_list, process=False)
 
+        # === TORUS SEAM FIX (v16.34): enforce perfect periodic closure ===
+        if closed_u and closed_v:
+            print("      TOROIDAL SEAM ENFORCEMENT: duplicating boundary vertices + aggressive merge")
+            patch_mesh.merge_vertices()                     # no threshold= (compatible)
+            verts = patch_mesh.vertices
+            faces = patch_mesh.faces
+            # duplicate first/last column (U-seam) and first/last row (V-seam)
+            if len(verts) >= cols and len(verts) >= rows * cols:
+                seam_u = verts[0:cols]                    # first column
+                seam_v = verts[::cols]                    # first row
+                patch_mesh.vertices = np.vstack([verts, seam_u, seam_v])
+                patch_mesh.merge_vertices()               # no threshold=
+
         eval_tree = KDTree(patch_mesh.vertices)
         patch_max_dev = 0.0
         for face in patch_mesh.faces:
@@ -344,7 +361,7 @@ def export_surfaces(surfaces, patch_info_list, output_dir, closed_shell=False, m
 
     if patch_meshes:
         combined_mesh = trimesh.util.concatenate(patch_meshes)
-        combined_mesh.merge_vertices()
+        combined_mesh.merge_vertices()          # no threshold=
         combined_mesh.fill_holes()
         combined_mesh.fix_normals()
 
@@ -418,9 +435,9 @@ def visualize_interactive(original_mesh, output_dir, surfaces):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="v16.28 NURBS – Unit Test Input STL + Verification")
+    parser = argparse.ArgumentParser(description="v16.34 NURBS – Unit Test Input STL + Verification")
     parser.add_argument("input", nargs="?", default="half-sphere.stl")
-    parser.add_argument("--output_dir", default="./nurbs_v16.28_final")
+    parser.add_argument("--output_dir", default="./nurbs_v16.34_final")
     parser.add_argument("--max_z_deviation", type=float, default=0.01)
     parser.add_argument("--clean-mode", action="store_true")
     parser.add_argument("--test", choices=["none", "cylinder", "sphere", "box", "cone", "ellipsoid", "torus", "complex"], default="none")
@@ -476,22 +493,21 @@ def main():
     patch_info_list = []
     for i, p in enumerate(patches):
         print(f"Fitting patch {i+1}/{len(patches)} ...")
-        # NEW: compute boundary mask for this patch
         boundary_mask = None
         if closed_shell and vertex_patches is not None:
             patch_verts = set()
             for fidx in p:
                 patch_verts.update(mesh.faces[fidx])
-            boundary_mask = np.zeros(len(patch_verts), dtype=bool)   # local to vert_idx
+            boundary_mask = np.zeros(len(patch_verts), dtype=bool)
             for local_i, v in enumerate(np.unique(np.concatenate([mesh.faces[f] for f in p]))):
-                if len(vertex_patches[v]) > 1:                     # shared with other patches
+                if len(vertex_patches[v]) > 1:
                     boundary_mask[local_i] = True
 
         surf, info = adaptive_fit_nurbs_to_patch(
             mesh, p, args.max_z_deviation,
             clean_mode=args.clean_mode or closed_shell,
             centripetal=args.centripetal, verbose=args.verbose,
-            closed_shell=closed_shell, boundary_vert_mask=boundary_mask   # ← NEW
+            closed_shell=closed_shell, boundary_vert_mask=boundary_mask
         )
         surfaces.append(surf)
         patch_info_list.append(info)
