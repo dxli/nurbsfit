@@ -1,5 +1,5 @@
 """
-✅ STANDALONE NURBS PATCH FITTER (v16.30 - LS + WATERTIGHT + FIXED PERIODIC KNOTS)
+✅ STANDALONE NURBS PATCH FITTER (v16.32 - ROBUST LS + CLOSED PATCH FIX)
 Run independently: python nurbs_patch_fitter.py
 """
 
@@ -58,10 +58,7 @@ def detect_patch_degree_svd(mesh, patch_faces, target_max_dev=0.5, clean_mode=Fa
 
 
 def make_knots(n_ctrl, deg, periodic=False):
-    """Correct knot vector generation (fixed for periodic cases)."""
     if periodic:
-        # Periodic: len(knots) == n_ctrl + deg + 1  (scipy requirement)
-        # Knots wrap around [0,1] → BSpline(extrapolate=periodic) works perfectly
         return [float(i - deg) / n_ctrl for i in range(n_ctrl + deg + 1)]
     else:
         internal = max(1, n_ctrl - deg)
@@ -69,7 +66,6 @@ def make_knots(n_ctrl, deg, periodic=False):
 
 
 def _bspline_basis(knots, degree, t, periodic=False):
-    """Univariate B-spline basis matrix – now consistent for both open & periodic."""
     n_basis = len(knots) - degree - 1
     basis = np.zeros((len(t), n_basis))
     for i in range(n_basis):
@@ -82,28 +78,27 @@ def _bspline_basis(knots, degree, t, periodic=False):
 
 def fit_b_spline_ls(uv, points, degree, n_ctrl_u, n_ctrl_v,
                     closed_u=False, closed_v=False, boundary_mask=None):
-    """Linear least-squares with periodic support + boundary weighting for watertight shells."""
+    """Robust weighted LS using lstsq (handles rank deficiency on closed patches)."""
     knot_u = make_knots(n_ctrl_u, degree, periodic=closed_u)
     knot_v = make_knots(n_ctrl_v, degree, periodic=closed_v)
     Bu = _bspline_basis(knot_u, degree, uv[:, 0], periodic=closed_u)
     Bv = _bspline_basis(knot_v, degree, uv[:, 1], periodic=closed_v)
 
-    # Tensor-product design matrix
     A = np.zeros((len(uv), n_ctrl_u * n_ctrl_v))
     for i in range(len(uv)):
         A[i] = np.kron(Bu[i], Bv[i])
 
-    # Weighted LS for closed shells (boundary points 50× stronger)
-    weights = np.ones(len(uv))
+    weights = np.ones(len(uv), dtype=float)
     if boundary_mask is not None:
         weights[boundary_mask] = 50.0
-    W = np.diag(weights)
 
+    # Weighted LS via lstsq (numerically stable)
+    sqrtW = np.sqrt(weights)[:, np.newaxis]
+    A_w = A * sqrtW
     ctrl = np.zeros((n_ctrl_u * n_ctrl_v, 3))
     for d in range(3):
-        ATA = A.T @ W @ A
-        ATb = A.T @ W @ points[:, d]
-        ctrl[:, d] = np.linalg.solve(ATA, ATb)
+        b_w = points[:, d] * sqrtW.ravel()
+        ctrl[:, d] = np.linalg.lstsq(A_w, b_w, rcond=None)[0]
 
     return ctrl, knot_u, knot_v
 
@@ -111,7 +106,7 @@ def fit_b_spline_ls(uv, points, degree, n_ctrl_u, n_ctrl_v,
 def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_mode=False,
                                 centripetal=True, verbose=False,
                                 closed_shell=False, boundary_vert_mask=None):
-    """Fit a single B-Rep patch – now fully stable on closed (sphere/toroidal) patches."""
+    """Fit a single B-Rep patch – now fully robust on torus/sphere patches."""
     faces = mesh.faces[patch_faces]
     vert_idx = np.unique(faces)
     original_points = mesh.vertices[vert_idx].copy()
@@ -137,7 +132,6 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
         centroid = np.mean(points_3d, axis=0)
         _, _, Vt = np.linalg.svd(points_3d - centroid, full_matrices=False)
         normal = Vt[-1]
-        # 4-corner bilinear plane
         corners = np.array([
             points_3d[np.argmin(points_3d[:,0])],
             points_3d[np.argmax(points_3d[:,0])],
@@ -157,7 +151,7 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
                       "closed": False, "toroidal": False,
                       "closed_u": False, "closed_v": False}
 
-    # UV-parameterization (toroidal / spherical / regular)
+    # UV-parameterization
     basis_u, basis_v, normal = compute_robust_local_basis(mesh, patch_faces)
     centroid = np.mean(points_3d, axis=0)
 
@@ -196,16 +190,21 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
     uv_range[uv_range < 1e-12] = 1.0
     uv = (uv - uv_min) / uv_range
 
-    # LS control-net size
+    # Robust control-net size
     base_ctrl = {1: 4, 2: 6, 3: 8}
     n_ctrl_base = base_ctrl.get(degree, 8)
     patch_diameter = np.max(np.ptp(points_3d, axis=0))
     diameter_factor = min(3.0, patch_diameter / 40.0) if closed_shell else min(2.5, patch_diameter / 50.0)
     n_ctrl = max(n_ctrl_base, int(n_ctrl_base * diameter_factor))
+    if closed_u or closed_v:
+        n_ctrl = max(n_ctrl, 16)                    # guaranteed stable for periodic
+    # Safety cap to avoid over-parameterization
+    if n_ctrl * n_ctrl > len(points_3d) * 2:
+        n_ctrl = max(8, int(np.sqrt(len(points_3d) * 1.5)))
     n_ctrl = min(n_ctrl, 20 if closed_shell else 16)
     print(f"      LS fit → {n_ctrl}×{n_ctrl} control points (periodic={closed_u or closed_v})")
 
-    # Least-squares fit (now works for closed patches)
+    # Robust least-squares fit
     ctrlpts_array, knot_u, knot_v = fit_b_spline_ls(
         uv, points_3d, degree, n_ctrl, n_ctrl,
         closed_u=closed_u, closed_v=closed_v,
@@ -249,7 +248,7 @@ def adaptive_fit_nurbs_to_patch(mesh, patch_faces, max_z_deviation=0.01, clean_m
         if z_dev <= max_z_deviation:
             break
 
-    # Final deviation check
+    # Final deviation
     eval_pts = np.array(surf.evalpts)
     tree = KDTree(eval_pts)
     _, idx = tree.query(original_points)
